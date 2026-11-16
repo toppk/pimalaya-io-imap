@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed closing a `client::ImapMailboxWatchStream` dropping its connection mid-IDLE: the worker now ends the IDLE with `DONE` and sends `LOGOUT`, unless the server leaves `DONE` unanswered past a second `shutdown_poll`.
+
 ## [0.11.2] - 2026-11-15
 
 ### Fixed

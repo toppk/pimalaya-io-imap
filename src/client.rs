@@ -1191,7 +1191,10 @@ impl ImapClientStd {
             let mut buf = [0u8; READ_BUFFER_SIZE];
             let mut arg: Option<Vec<u8>> = None;
             let mut opened_tx = Some(opened_tx);
+            let mut stopping = false;
 
+            // NOTE: true when the watch ended cleanly, so the connection
+            // is between commands and can be logged out.
             let mut pump = || loop {
                 let state = watcher.resume(&mut fragmentizer, arg.as_deref());
 
@@ -1208,10 +1211,10 @@ impl ImapClientStd {
                     ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(e)) => {
                         arg = None;
                         if tx.send(Ok(e)).is_err() {
-                            return;
+                            return false;
                         }
                     }
-                    ImapCoroutineState::Complete(Ok(())) => return,
+                    ImapCoroutineState::Complete(Ok(())) => return true,
                     ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsTag) => {
                         let tag = tags.generate();
                         arg = Some(tag.as_ref().as_bytes().to_vec());
@@ -1222,7 +1225,7 @@ impl ImapClientStd {
                                 let eof = io::ErrorKind::UnexpectedEof;
                                 let err = "IMAP server closed the connection during watch";
                                 tx.send(Err(io::Error::new(eof, err).into())).ok();
-                                return;
+                                return false;
                             }
                             Ok(n) => arg = Some(buf[..n].to_vec()),
                             // NOTE: the SO_RCVTIMEO wakeup this loop arms
@@ -1231,7 +1234,8 @@ impl ImapClientStd {
                             // failure but the periodic chance to re-check
                             // shutdown and otherwise resume, so the
                             // coroutine can observe the flag and issue
-                            // IDLE DONE.
+                            // IDLE DONE. A second wakeup once shut down
+                            // means the server never answered it.
                             Err(err)
                                 if matches!(
                                     err.kind(),
@@ -1239,20 +1243,23 @@ impl ImapClientStd {
                                 ) =>
                             {
                                 if shutdown.load(Ordering::SeqCst) {
-                                    return;
+                                    if stopping {
+                                        return false;
+                                    }
+                                    stopping = true;
                                 }
                                 arg = None;
                             }
                             Err(err) => {
                                 tx.send(Err(err.into())).ok();
-                                return;
+                                return false;
                             }
                         }
                     }
                     ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(bytes)) => {
                         if let Err(err) = stream.write_all(&bytes).and_then(|()| stream.flush()) {
                             tx.send(Err(err.into())).ok();
-                            return;
+                            return false;
                         }
                         arg = None;
                     }
@@ -1265,7 +1272,7 @@ impl ImapClientStd {
 
                         while left > Duration::ZERO {
                             if shutdown.load(Ordering::SeqCst) {
-                                return;
+                                return true;
                             }
 
                             let step = left.min(opts.shutdown_poll);
@@ -1277,12 +1284,25 @@ impl ImapClientStd {
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
                         tx.send(Err(err.into())).ok();
-                        return;
+                        return false;
                     }
                 }
             };
 
-            pump();
+            if pump() && shutdown.load(Ordering::SeqCst) {
+                let mut client = ImapClientStd {
+                    stream,
+                    fragmentizer,
+                    tags,
+                    auto_id: None,
+                    pre_authenticated: false,
+                };
+
+                // NOTE: at most one more shutdown poll, the read timeout
+                // still being armed; a failed LOGOUT only skips the goodbye.
+                client.logout().ok();
+            }
+
             watcher.state()
         });
 
@@ -1665,6 +1685,8 @@ pub trait ImapStream: Read + Write + Send + Any {
 mod tests {
     use core::mem;
 
+    use std::sync::Mutex;
+
     use imap_codec::imap_types::response::{Code, StatusKind};
 
     use crate::client::*;
@@ -1850,13 +1872,76 @@ mod tests {
         assert_eq!(StatusKind::No, status.kind);
     }
 
+    #[test]
+    fn closing_a_watch_stream_ends_its_idle_and_logs_out() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let stream = watch_stream_sent(sent.clone(), |command| {
+            if command.contains("EXAMINE") {
+                "* OK [UIDVALIDITY 1] uid validity\r\n{tag} OK [READ-ONLY] done\r\n"
+            } else if command.contains("IDLE") {
+                "+ idling\r\n"
+            } else if command.contains("LOGOUT") {
+                "* BYE logging out\r\n{tag} OK done\r\n"
+            } else {
+                "{tag} OK done\r\n"
+            }
+        });
+
+        assert_eq!(Ok(()), stream.wait_opened(Duration::from_secs(5)));
+        while !sent.lock().unwrap().iter().any(|c| c.contains("IDLE")) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        stream.close().expect("worker wound down");
+
+        let sent = sent.lock().unwrap();
+        let idle = sent.iter().position(|c| c.contains("IDLE")).expect("IDLE");
+        let after: Vec<_> = sent[idle + 1..].iter().map(|c| c.trim_end()).collect();
+        assert_eq!("DONE", after[0]);
+        assert!(after[1].ends_with(" LOGOUT"), "{after:?}");
+    }
+
+    #[test]
+    fn closing_a_watch_stream_whose_server_ignores_done_skips_the_logout() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let stream = watch_stream_sent(sent.clone(), |command| {
+            if command.contains("EXAMINE") {
+                "* OK [UIDVALIDITY 1] uid validity\r\n{tag} OK [READ-ONLY] done\r\n"
+            } else if command.contains("IDLE") {
+                "+ idling\r\n"
+            } else if command.starts_with("DONE") {
+                ""
+            } else {
+                "{tag} OK done\r\n"
+            }
+        });
+
+        assert_eq!(Ok(()), stream.wait_opened(Duration::from_secs(5)));
+        while !sent.lock().unwrap().iter().any(|c| c.contains("IDLE")) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        stream.close().expect("worker wound down");
+
+        let sent = sent.lock().unwrap();
+        assert_eq!("DONE", sent.last().expect("a command").trim_end());
+    }
+
     /// The fallback watch of INBOX over a [`ScriptStream`] answering
     /// with `answer`.
     fn watch_stream(answer: fn(&str) -> &'static str) -> ImapMailboxWatchStream {
+        watch_stream_sent(Arc::default(), answer)
+    }
+
+    /// [`watch_stream`], each command it sends also pushed to `sent`.
+    fn watch_stream_sent(
+        sent: Arc<Mutex<Vec<String>>>,
+        answer: fn(&str) -> &'static str,
+    ) -> ImapMailboxWatchStream {
         let stream = ScriptStream {
             answer,
             unflushed: Vec::new(),
             replies: Vec::new(),
+            last_tag: String::new(),
+            sent,
         };
         let opts = ImapMailboxWatchStreamOptions {
             shutdown_poll: Duration::from_millis(10),
@@ -1933,11 +2018,14 @@ mod tests {
     }
 
     /// A stream answering each flushed command with `answer`, `{tag}`
-    /// standing for its tag, and timing out once the answers are read.
+    /// standing for its tag (a `DONE` taking its IDLE's), and timing out
+    /// once the answers are read.
     struct ScriptStream {
         answer: fn(&str) -> &'static str,
         unflushed: Vec<u8>,
         replies: Vec<u8>,
+        last_tag: String,
+        sent: Arc<Mutex<Vec<String>>>,
     }
 
     impl Read for ScriptStream {
@@ -1967,9 +2055,12 @@ mod tests {
                 return Ok(());
             }
 
-            let tag = command.split(' ').next().unwrap_or_default();
-            let reply = (self.answer)(&command).replace("{tag}", tag);
+            if !command.starts_with("DONE") {
+                self.last_tag = command.split(' ').next().unwrap_or_default().into();
+            }
+            let reply = (self.answer)(&command).replace("{tag}", &self.last_tag);
             self.replies.extend_from_slice(reply.as_bytes());
+            self.sent.lock().unwrap().push(command);
             Ok(())
         }
     }
